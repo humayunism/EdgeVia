@@ -1,0 +1,124 @@
+// FairFlow Database Schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Tenant {
+  id               String   @id @default(cuid())
+  name             String
+  email            String   @unique
+  passwordHash     String
+  plan             Plan     @default(STARTER)
+  stripeCustomerId String?
+  stripeSubId      String?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  sites        Site[]
+  events       Event[]
+  auditLogs    AuditLog[]
+  billingUsage BillingUsage[]
+
+  @@map("tenants")
+}
+
+model Site {
+  id         String  @id @default(cuid())
+  tenantId   String
+  domain     String  @unique
+  originUrl  String
+  rpsLimit   Int     @default(100)
+  burstSize  Int     @default(200)
+  active     Boolean @default(true)
+  createdAt  DateTime @default(now())
+
+  tenant     Tenant        @relation(fields: [tenantId], references: [id])
+  events     Event[]
+  analytics  AnalyticsHourly[]
+  sslCert    SslCert?
+
+  @@map("sites")
+}
+
+model Event {
+  id        String   @id @default(cuid())
+  siteId    String
+  tenantId  String
+  name      String
+  startsAt  DateTime
+  endsAt    DateTime
+  active    Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  site   Site   @relation(fields: [siteId], references: [id])
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+
+  @@map("events")
+}
+
+model AnalyticsHourly {
+  id           String   @id @default(cuid())
+  siteId       String
+  hour         DateTime
+  reqCount     Int      @default(0)
+  queuedCount  Int      @default(0)
+  blockedCount Int      @default(0)
+  avgLatencyMs Float    @default(0)
+
+  site Site @relation(fields: [siteId], references: [id])
+
+  @@unique([siteId, hour])
+  @@map("analytics_hourly")
+}
+
+model SslCert {
+  id         String   @id @default(cuid())
+  siteId     String   @unique
+  domain     String
+  certPem    String
+  expiresAt  DateTime
+  renewedAt  DateTime @default(now())
+
+  site Site @relation(fields: [siteId], references: [id])
+
+  @@map("ssl_certs")
+}
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  tenantId  String
+  action    String
+  payload   Json?
+  createdAt DateTime @default(now())
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+
+  @@map("audit_logs")
+}
+
+model BillingUsage {
+  id          String   @id @default(cuid())
+  tenantId    String
+  periodStart DateTime
+  periodEnd   DateTime
+  reqCount    Int      @default(0)
+  billed      Boolean  @default(false)
+  createdAt   DateTime @default(now())
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+
+  @@map("billing_usage")
+}
+
+enum Plan {
+  STARTER
+  GROWTH
+  BUSINESS
+  ENTERPRISE
+}

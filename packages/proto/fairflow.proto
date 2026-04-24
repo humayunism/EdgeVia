@@ -1,0 +1,37 @@
+syntax = "proto3";
+package fairflow;
+option go_package = "github.com/fairflow/proxy/proto";
+
+service ProxyConfig {
+  rpc GetSiteConfig (SiteConfigRequest) returns (SiteConfigResponse);
+  rpc UpdateSiteConfig (SiteConfig) returns (Ack);
+  rpc ReportMetrics (MetricsBatch) returns (Ack);
+  rpc GetCircuitState (CircuitStateRequest) returns (CircuitStateResponse);
+}
+
+message SiteConfigRequest { string domain = 1; }
+
+message SiteConfig {
+  string tenant_id = 1;
+  string domain = 2;
+  string origin_url = 3;
+  int32 rps_limit = 4;
+  int32 burst_size = 5;
+  bool active = 6;
+}
+
+message SiteConfigResponse { SiteConfig config = 1; }
+
+message MetricsBatch {
+  string tenant_id = 1;
+  string domain = 2;
+  int64 timestamp = 3;
+  int32 requests_total = 4;
+  int32 queued_total = 5;
+  int32 blocked_total = 6;
+  double avg_latency_ms = 7;
+}
+
+message CircuitStateRequest { string domain = 1; }
+message CircuitStateResponse { string state = 1; }
+message Ack { bool success = 1; }

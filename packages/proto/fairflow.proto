@@ -1,6 +1,6 @@
 syntax = "proto3";
-package fairflow;
-option go_package = "github.com/fairflow/proxy/proto";
+package edgevia;
+option go_package = "github.com/edgevia/proxy/proto";
 
 service ProxyConfig {
   rpc GetSiteConfig (SiteConfigRequest) returns (SiteConfigResponse);

@@ -1,24 +1,24 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: fairflow-proxy
-  namespace: fairflow
+  name: edgevia-proxy
+  namespace: edgevia
 spec:
   replicas: 3
   selector:
     matchLabels:
-      app: fairflow-proxy
+      app: edgevia-proxy
   template:
     metadata:
       labels:
-        app: fairflow-proxy
+        app: edgevia-proxy
       annotations:
         prometheus.io/scrape: "true"
         prometheus.io/port: "9090"
     spec:
       containers:
         - name: proxy
-          image: fairflow/proxy:latest
+          image: edgevia/proxy:latest
           ports:
             - containerPort: 8080
             - containerPort: 8443
@@ -27,7 +27,7 @@ spec:
             - name: REDIS_URL
               valueFrom:
                 secretKeyRef:
-                  name: fairflow-secrets
+                  name: edgevia-secrets
                   key: redis-url
           resources:
             requests:

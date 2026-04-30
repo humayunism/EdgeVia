@@ -7,6 +7,6 @@ async function bootstrap() {
   app.useGlobalPipes(new ValidationPipe({ whitelist: true }));
   app.enableCors({ origin: process.env.DASHBOARD_URL });
   await app.listen(4000);
-  console.log('FairFlow API running on port 4000');
+  console.log('Edgevia API running on port 4000');
 }
 bootstrap();

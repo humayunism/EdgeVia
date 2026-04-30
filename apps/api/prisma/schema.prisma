@@ -1,4 +1,4 @@
-// FairFlow Database Schema
+// Edgevia Database Schema
 
 generator client {
   provider = "prisma-client-js"

@@ -1,5 +1,5 @@
 {
-  "name": "@fairflow/api",
+  "name": "@edgevia/api",
   "version": "1.0.0",
   "scripts": {
     "dev": "nest start --watch",

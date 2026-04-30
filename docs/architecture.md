@@ -1,365 +1,441 @@
 # Edgevia Architecture
 
-**Version:** 1.0.0  
-**Source of truth:** `docs/edgevia-srs.pdf`  
-**Status:** Revised architecture blueprint
+This document restates the architecture defined in `docs/edgevia-srs.pdf` and is aligned to the SRS titled `EDGEVIA Software Requirements Specification & System Architecture Blueprint`, version `1.0.0`, dated `April 2026`.
 
-## 1. Overview
+## 1. Architecture Summary
 
-Edgevia is a multi-tenant reverse proxy and traffic management platform built to protect customer applications during sudden traffic spikes. It sits between the public internet and a customer's origin server, enforcing rate limits, activating a virtual waiting room when demand exceeds capacity, and preserving service availability during high-pressure events such as flash sales, ticket launches, and viral traffic surges.
+Edgevia is a high-performance, multi-tenant reverse proxy and traffic management platform designed to protect customer origin servers during sudden traffic spikes such as flash sales, product drops, ticket releases, and viral events.
 
-The platform is designed around three goals:
+The system follows a polyglot microservices architecture:
 
-1. Protect origin infrastructure from overload.
-2. Provide fair user access during peak demand.
-3. Offer enterprise-style traffic controls at startup-friendly cost.
+- `Go` powers the performance-critical proxy layer.
+- `Node.js + NestJS` handles business logic, configuration, tenant management, billing, and integrations.
+- `Next.js 14` provides the dashboard and operational control plane.
+- `Redis` backs rate limiting, queue state, and real-time coordination.
+- `PostgreSQL` stores durable tenant, site, billing, analytics, and certificate data.
 
-## 2. Architecture Summary
+Production deployment targets `Kubernetes` from day one. `Docker Compose` is used for local development only.
 
-Edgevia uses a polyglot microservices architecture deployed to Kubernetes in production and Docker Compose for local development.
+## 2. High-Level System View
 
-### Core architectural characteristics
+External traffic enters Edgevia only through the Go Proxy Engine. Internal services communicate over `gRPC`, while dashboard updates are pushed in real time via `Socket.io`.
 
-- Go handles the latency-sensitive proxy path.
-- NestJS owns business logic, tenant management, billing, and analytics APIs.
-- Next.js provides the operator dashboard and customer-facing management UI.
-- Redis supports rate limiting, queue state, caching, and pub/sub.
-- PostgreSQL stores durable tenant, site, billing, and analytics data.
-- gRPC is used for internal service-to-service communication.
-- Socket.io pushes real-time operational metrics to the dashboard.
+```text
+                         Internet Traffic
+                                |
+                         Load Balancer
+                           (80 / 443)
+                                |
+                                v
+                     +----------------------+
+                     |   Go Proxy Engine    |
+                     |----------------------|
+                     | SNI domain routing   |
+                     | Token bucket limiting|
+                     | Waiting room queue   |
+                     | Circuit breaker      |
+                     | SSL autocert         |
+                     | Prometheus metrics   |
+                     +----+-----------+-----+
+                          |           |
+                 Redis checks         | gRPC
+                          |           v
+                          |   +----------------------+
+                          |   |   NestJS API         |
+                          |   |----------------------|
+                          |   | Auth                 |
+                          |   | Site management      |
+                          |   | Billing              |
+                          |   | Analytics            |
+                          |   | Config sync          |
+                          |   +----+-----------+-----+
+                          |        |           |
+                          |        |           +------------------+
+                          |        |                              |
+                          v        v                              v
+                   +-------------+   +------------------+   +------------------+
+                   |   Redis 7   |   |   PostgreSQL     |   |  BullMQ Workers  |
+                   |-------------|   |------------------|   |------------------|
+                   | Buckets     |   | Tenants          |   | Usage metering   |
+                   | Queues      |   | Sites            |   | Billing events   |
+                   | Config cache|   | Events           |   | Emails           |
+                   | Pub/Sub     |   | Analytics        |   +------------------+
+                   | Streams     |   | SSL certs        |
+                   +-------------+   | Audit logs       |
+                                     | Billing usage    |
+                                     +------------------+
 
-## 3. High-Level System Components
+ Browser <-------------------- Socket.io --------------------> Next.js Dashboard
+```
 
-| Component | Primary Responsibility | Technology |
-| --- | --- | --- |
-| Proxy Engine | Reverse proxying, rate limiting, queueing, circuit breaking, SSL termination | Go |
-| Management API | Auth, site management, analytics, billing, events, notifications | Node.js + NestJS |
-| Dashboard | Real-time control plane and observability UI | Next.js 14 |
-| Cache and Queue | Token buckets, waiting room queues, cached site config, pub/sub | Redis 7 |
-| System of Record | Tenants, sites, events, certificates, usage, analytics | PostgreSQL + Prisma |
-| Async Workers | Metering, notifications, aggregation, billing workflows | BullMQ |
-| Observability | Metrics, dashboards, logs, traces | Prometheus, Grafana, Zap, Pino, OpenTelemetry |
+## 3. Core Architectural Pattern
 
-## 4. Request Flow
+### 3.1 Polyglot Microservices
 
-### Normal request path
+Edgevia separates concerns by execution profile:
 
-1. A client request reaches the public load balancer on port `80` or `443`.
-2. Traffic is forwarded to the Go Proxy service.
-3. The proxy resolves the tenant and site configuration for the requested domain.
-4. Redis is checked for token bucket state and queue status.
-5. If the request is within threshold, the proxy forwards it to the customer's origin server.
-6. Metrics are emitted to Prometheus and reported upstream to the API layer.
+- `Go` is used for low-latency request handling and concurrency-heavy proxy work.
+- `NestJS` is used for modular business workflows such as authentication, billing, configuration, and analytics.
+- `Next.js 14` is used for the operator-facing dashboard with SSR and real-time client updates.
 
-### Overload path
+### 3.2 Internal Communication Model
 
-1. The proxy detects that the token bucket is exhausted or queue depth exceeds the configured threshold.
-2. The request is placed into a tenant-isolated FIFO queue in Redis.
-3. The user receives a branded waiting room page.
-4. Queue position updates are delivered via WebSocket or SSE.
-5. When capacity becomes available, the request is released fairly back into the allowed path.
+- `gRPC + Protocol Buffers` connect the Go proxy and NestJS API for configuration lookup, configuration update propagation, metrics reporting, and circuit-state retrieval.
+- `Socket.io` delivers live metrics and state updates from the API to the dashboard.
+- `Redis pub/sub` and `Redis streams` support internal real-time coordination.
 
-### Failure protection path
+## 4. Primary Services
 
-1. The proxy monitors origin error rates.
-2. If the error rate exceeds 50% within a 10-second window, the circuit breaker opens.
-3. Requests are blocked or queued while the origin stabilizes.
-4. Recovery is tested in a half-open state with limited traffic.
-5. Customers are notified through webhook and email channels.
+### 4.1 Go Proxy Engine
 
-## 5. Core Service Design
+The Go Proxy Engine is the only service exposed to public request traffic. It is responsible for:
 
-### 5.1 Proxy Engine
+- SNI-based domain detection and request routing
+- reverse proxying to customer origin servers
+- per-tenant, per-domain token-bucket rate limiting
+- activation of the Virtual Waiting Room when thresholds are exceeded
+- FIFO queue admission behavior
+- crawler bypass for verified Google and Bing bots
+- circuit-breaker protection for overloaded or failing origins
+- automatic SSL provisioning and renewal with Let's Encrypt via `autocert`
+- Prometheus metric emission
 
-The Go proxy is the system’s performance-critical edge component. It is responsible for:
+Key behaviors defined by the SRS:
 
-- TLS termination and automatic certificate provisioning
-- Reverse proxying to customer origins
-- Tenant-aware request routing
-- Redis-backed token bucket rate limiting
-- Virtual waiting room enforcement
-- Circuit breaker evaluation
-- Prometheus metrics emission
+- customer onboarding begins with a `CNAME` pointed to the Edgevia proxy
+- the proxy detects the domain through `SNI`
+- origin configuration is stored in PostgreSQL and cached in Redis
+- SSL certificates are expected to auto-provision within `60 seconds`
 
-The design choice is intentional: Go’s concurrency model supports high connection counts and low request overhead, making it suitable for the hot path.
+### 4.2 NestJS Management API
 
-### 5.2 Management API
+The NestJS API is the control plane for Edgevia. It is responsible for:
 
-The NestJS API acts as the platform control plane. It owns:
+- tenant registration and authentication
+- JWT access token issuance and refresh handling
+- protected site CRUD operations
+- configuration changes such as RPS limit and origin URL updates
+- analytics retrieval
+- event mode activation
+- billing and subscription workflows
+- Stripe webhook processing
+- usage metering coordination
+- real-time dashboard event publishing
+- audit logging
 
-- JWT-based authentication
-- tenant and site lifecycle management
-- dashboard data aggregation
-- billing and Stripe integration
-- event mode configuration
-- notification delivery
-- configuration sync for proxy consumers
+The API persists long-lived data in PostgreSQL and coordinates fast-changing operational data through Redis.
 
-This service is optimized for maintainability, modularity, and typed business workflows rather than raw edge-path performance.
+### 4.3 Next.js Dashboard
 
-### 5.3 Dashboard
+The dashboard is the single-page operational nerve center for customers. It provides:
 
-The Next.js dashboard is the operational nerve center for customers and platform operators. It provides:
-
-- live visitors, queue depth, RPS, latency, and health views
-- multi-site switching
-- inline RPS updates
-- waiting room customization
+- live visitor counts
+- queue depth visualization
+- system health display
+- protected revenue counters
+- current RPS gauges
+- origin response-time charts
+- site switching across protected domains
+- inline RPS configuration updates without page reload
+- waiting-room editing with live preview
+- traffic analytics for `7 / 30 / 90` day windows
 - event mode controls
-- billing and usage visibility
-- alert and webhook configuration
+- billing and plan management
+- alert settings including webhook URL, email, and Slack integration
 
-## 6. Technology Stack
+### 4.4 Redis
 
-| Layer | Technology | Why it is used |
-| --- | --- | --- |
-| Proxy Engine | Go | High concurrency, low latency, efficient network I/O |
-| API Layer | Node.js + NestJS | Modular business logic, typed architecture, strong ecosystem |
-| Frontend | Next.js 14 App Router | SSR for first load, responsive operator UI, real-time patterns |
-| Database | PostgreSQL + Prisma | Durable relational storage with strong consistency |
-| Cache / Queue | Redis 7 | Fast token bucket operations, queue state, pub/sub |
-| Job Queue | BullMQ | Background jobs for metering, email, and aggregation |
-| Internal RPC | gRPC + Protocol Buffers | Efficient binary contracts between services |
-| Real-Time Updates | Socket.io | Dashboard live updates |
-| SSL Automation | Let's Encrypt + Go `autocert` | Automatic certificate issuance and renewal |
-| Metrics | Prometheus + Grafana | Operational monitoring and alerting |
-| Logging | Zap and Pino | Structured low-overhead application logs |
-| Tracing | OpenTelemetry | Distributed tracing across services |
-| Object Storage | AWS S3 or Cloudflare R2 | Waiting room assets and exports |
-| Billing | Stripe | Subscription and usage-based billing |
-| Email | Resend | Transactional messaging |
-| DNS Automation | Cloudflare API | Programmatic customer domain setup |
+Redis is used for low-latency shared state:
 
-## 7. Feature Architecture
+- token bucket state for rate limiting
+- FIFO waiting-room queue state
+- cached site configuration
+- request metrics streams
+- pub/sub for live dashboard metrics
+- circuit-breaker state
+- BullMQ backing data
+
+### 4.5 PostgreSQL
+
+PostgreSQL is the durable system of record for:
+
+- tenants
+- protected sites
+- scheduled event-mode records
+- hourly analytics aggregates
+- SSL certificate metadata and certificate cache
+- audit logs
+- billing usage records
+
+## 5. Technology Stack
+
+| Layer | Technology | Purpose |
+|---|---|---|
+| Proxy Engine | Go (Golang) | Handles 50K+ concurrent connections with sub-ms latency |
+| Management API | Node.js + NestJS | Typed, modular business logic for auth, config, analytics, and billing |
+| Frontend Dashboard | Next.js 14 (App Router) | SSR first load with real-time operator experience |
+| Primary Database | PostgreSQL + Prisma ORM | Durable ACID storage for tenants, billing, and site state |
+| Cache + Queue | Redis 7 | Token buckets, queue state, config cache, pub/sub, streams |
+| Job Queue | BullMQ | Background jobs for analytics, email, and billing events |
+| Internal Comms | gRPC + Protocol Buffers | Type-safe service-to-service communication |
+| Real-Time UI | Socket.io | Dashboard live updates |
+| SSL Automation | Let's Encrypt + `autocert` | Automatic certificate provisioning per domain |
+| Metrics | Prometheus + Grafana | Monitoring, visibility, and alerting |
+| Logging | Zap (Go) + Pino (Node.js) | Structured low-overhead JSON logging |
+| Tracing | OpenTelemetry | Distributed tracing across proxy and API |
+| Containers | Docker + Kubernetes | Packaging and production orchestration |
+| Object Storage | AWS S3 or Cloudflare R2 | Waiting-room assets, logos, analytics exports |
+| Billing | Stripe | Subscriptions, metering, invoices, webhooks |
+| Email | Resend | Transactional alerts and onboarding email |
+| DNS | Cloudflare API | Programmatic CNAME and DNS-related setup support |
+
+## 6. Request Lifecycle
+
+### 6.1 Protected Request Flow
+
+1. A browser sends HTTPS traffic to Edgevia through the public load balancer.
+2. The Go proxy resolves the requested domain using `SNI`.
+3. The proxy loads site configuration from Redis or retrieves it from the API via `gRPC`.
+4. The proxy checks the tenant/domain token bucket in Redis.
+5. If capacity exists, the request is forwarded to the origin server.
+6. If capacity is exhausted, the request is added to the waiting-room queue instead of being dropped.
+7. If the queue threshold is exceeded, the user is served the branded waiting-room page.
+8. Queue position is updated in real time via `WebSocket or SSE` as defined by the SRS.
+9. Verified search-engine crawlers can bypass the queue.
+10. Circuit-breaker logic can stop forwarding traffic to an unhealthy origin and hold or shed traffic safely.
+
+### 6.2 Dashboard Flow
+
+1. The customer uses the dashboard in the browser.
+2. The dashboard communicates with the NestJS API for CRUD and reporting operations.
+3. Real-time metrics are pushed from the API to the dashboard through `Socket.io`.
+4. The API reads durable state from PostgreSQL and fast-changing state from Redis.
+
+### 6.3 Billing Flow
+
+1. Request usage is accumulated operationally.
+2. BullMQ workers report usage to Stripe every hour.
+3. The API exposes billing usage and plan-management endpoints to the dashboard.
+4. Alerts are raised at `80%` and `95%` of plan limits.
+
+## 7. Core Protection Mechanisms
 
 ### 7.1 Zero-Configuration Onboarding
 
-Customer onboarding is designed to be fast and low-friction:
+- customer points a `CNAME` record to Edgevia
+- proxy detects the new domain automatically via `SNI`
+- certificate issuance is handled automatically
+- origin URL is stored in PostgreSQL and cached in Redis
 
-1. The customer creates a CNAME record pointing their domain to Edgevia.
-2. The proxy detects the incoming domain through SNI.
-3. Edgevia provisions an SSL certificate automatically.
-4. Origin configuration is stored in PostgreSQL and cached in Redis.
-5. The site becomes traffic-ready, with the SRS targeting completion within roughly 60 seconds.
+### 7.2 Token-Bucket Rate Limiting
 
-### 7.2 Rate Limiting
+Each tenant receives an isolated Redis-backed bucket:
 
-Rate limiting uses a tenant-isolated token bucket model stored in Redis.
-
-Key pattern:
-
-```text
-tenant:{tenantId}:bucket:{domain}
-```
-
-Behavior:
-
-- buckets refill at the configured requests-per-second rate
-- bursts are allowed for short windows, such as `2x RPS for 5 seconds`
-- when the bucket empties, requests are queued rather than dropped
+- key pattern: `tenant:{tenantId}:bucket:{domain}`
+- refill rate matches configured `RPS`
+- when empty, traffic is queued rather than dropped
+- burst allowance is configurable, for example `2x RPS for 5 seconds`
 
 ### 7.3 Virtual Waiting Room
 
-The waiting room is triggered when incoming traffic exceeds configured capacity. It is designed to preserve fairness and protect origin stability.
-
-Capabilities include:
-
-- tenant-branded queue page
-- FIFO admission order
-- real-time queue position updates
-- bot and crawler bypass for verified search engines
-- preserved client IP forwarding through `X-Forwarded-For`
+- activates when queue depth exceeds threshold
+- serves a branded customizable HTML/CSS waiting room
+- maintains a fair `FIFO` queue with no position jumping
+- exposes real-time position updates
+- preserves `X-Forwarded-For` for origin-side IP logging
 
 ### 7.4 Circuit Breaker
 
-The circuit breaker protects unhealthy origins from cascading failure.
+The proxy protects origin servers from cascading failure using three states:
 
-States:
+- `CLOSED`: normal forwarding
+- `OPEN`: traffic blocked from origin
+- `HALF_OPEN`: limited test traffic allowed
 
-```text
-CLOSED -> OPEN -> HALF-OPEN
-```
+SRS-defined behavior:
 
-Open-state criteria from the SRS:
-
-- origin error rate greater than `50%`
-- measured over a `10 second` window
-
-Recovery behavior:
-
-- limited test traffic in half-open mode
-- automatic resumption if the origin is healthy again
-- webhook and email notification on open events
+- opens when origin error rate exceeds `50%` in a `10 second` window
+- auto-recovery sends `10%` of traffic to probe origin health
+- customers are notified through webhook or email when the circuit opens
 
 ## 8. Multi-Tenant Isolation Model
 
-Tenant isolation is enforced at several layers:
+Tenant isolation is enforced across layers:
 
-- Redis key namespacing with `tenant:{tenantId}:...`
-- PostgreSQL Row-Level Security for persistent data boundaries
-- Kubernetes `NetworkPolicy` isolation between service contexts
-- audit logging for tenant configuration changes
+- all Redis keys are prefixed with `tenant:{tenantId}:`
+- PostgreSQL enforces `Row-Level Security (RLS)` per tenant
+- Kubernetes `NetworkPolicy` isolates tenant namespaces
+- audit logs record tenant configuration changes
 
-This layered model prevents cross-tenant leakage across cache, queue, storage, and network boundaries.
+This architecture treats tenancy as a first-class boundary in both storage and runtime communication.
 
-## 9. Real-Time Dashboard Metrics
+## 9. Data Architecture
 
-| Metric | Presentation | Source | Update Rate |
-| --- | --- | --- | --- |
-| Live visitors | Animated counter | Redis pub/sub | 1s |
-| Queue depth | Counter and chart | Redis queue length | 500ms |
-| System health | Pulsing status icon | Circuit breaker state | 2s |
-| Protected revenue | Currency counter | PostgreSQL + Stripe | 5s |
-| Current RPS | Gauge / speedometer | Prometheus | 1s |
-| Origin response time | Line chart | Go proxy latency | 1s |
-
-## 10. Billing Architecture
-
-Billing is subscription-based and integrated with Stripe.
-
-Supported billing workflows:
-
-- subscription lifecycle management
-- hourly usage metering via BullMQ workers
-- overage alerts at `80%` and `95%` of plan limits
-- self-service plan upgrades and downgrades
-- downloadable invoice history
-- event add-on purchase flow
-
-## 11. Repository Structure
-
-The SRS describes a monorepo organized around three applications plus shared packages. The current repository aligns with that structure:
-
-```text
-EdgeVia/
-├── apps/
-│   ├── proxy/        # Go reverse proxy and edge runtime
-│   ├── api/          # NestJS management API
-│   └── dashboard/    # Next.js dashboard
-├── packages/
-│   ├── proto/        # Shared protobuf definitions
-│   └── types/        # Shared application types
-├── infra/            # Kubernetes and infrastructure assets
-├── docs/             # Architecture, API, onboarding, SRS
-├── scripts/          # Setup and seed automation
-├── pnpm-workspace.yaml
-└── turbo.json
-```
-
-### Intended module boundaries
-
-- `apps/proxy/internal/proxy`: reverse proxy transport and handlers
-- `apps/proxy/internal/ratelimit`: Redis token bucket logic
-- `apps/proxy/internal/queue`: waiting room queue and position handling
-- `apps/proxy/internal/circuitbreaker`: origin health protection
-- `apps/proxy/internal/ssl`: certificate automation
-- `apps/api/src/modules`: business modules such as auth, sites, analytics, billing, tenants, notifications, and events
-- `apps/dashboard`: operator UI, charts, site switching, settings, and waiting room editor
-
-## 12. Data Model
-
-### Primary relational tables
+### 9.1 Key PostgreSQL Tables
 
 | Table | Key Fields | Purpose |
-| --- | --- | --- |
-| `tenants` | `id`, `name`, `plan`, `stripe_customer_id`, `created_at` | Customer account records |
-| `sites` | `id`, `tenant_id`, `domain`, `origin_url`, `rps_limit`, `active` | Protected domains and origin config |
-| `events` | `id`, `site_id`, `name`, `starts_at`, `ends_at`, `active` | Scheduled event mode windows |
-| `analytics_hourly` | `id`, `site_id`, `hour`, `req_count`, `queued_count`, `blocked_count` | Aggregated traffic analytics |
-| `ssl_certs` | `id`, `site_id`, `domain`, `cert_pem`, `expires_at`, `renewed_at` | Certificate cache metadata |
-| `audit_logs` | `id`, `tenant_id`, `action`, `payload`, `created_at` | Configuration audit trail |
-| `billing_usage` | `id`, `tenant_id`, `period_start`, `period_end`, `req_count`, `billed` | Usage metering for billing |
+|---|---|---|
+| `tenants` | `id`, `name`, `plan`, `stripe_customer_id`, `created_at` | One row per Edgevia customer |
+| `sites` | `id`, `tenant_id`, `domain`, `origin_url`, `rps_limit`, `active` | Protected customer domains |
+| `events` | `id`, `site_id`, `name`, `starts_at`, `ends_at`, `active` | Scheduled event-mode sessions |
+| `analytics_hourly` | `id`, `site_id`, `hour`, `req_count`, `queued_count`, `blocked_count` | Aggregated traffic data |
+| `ssl_certs` | `id`, `site_id`, `domain`, `cert_pem`, `expires_at`, `renewed_at` | Let's Encrypt certificate cache |
+| `audit_logs` | `id`, `tenant_id`, `action`, `payload`, `created_at` | Configuration change history |
+| `billing_usage` | `id`, `tenant_id`, `period_start`, `period_end`, `req_count`, `billed` | Stripe usage metering records |
 
-### Redis key patterns
+### 9.2 Redis Key Patterns
 
 | Key Pattern | Type | Purpose |
-| --- | --- | --- |
+|---|---|---|
 | `tenant:{id}:bucket:{domain}` | Hash | Token bucket state |
-| `tenant:{id}:queue:{domain}` | List | FIFO waiting room queue |
-| `tenant:{id}:config:{domain}` | Hash | Cached site configuration |
-| `tenant:{id}:metrics:{domain}` | Stream | Real-time metric stream |
-| `breaker:{domain}` | String | Circuit breaker state |
+| `tenant:{id}:queue:{domain}` | List | Virtual waiting-room FIFO queue |
+| `tenant:{id}:config:{domain}` | Hash | Cached site config including origin URL and RPS limit |
+| `tenant:{id}:metrics:{domain}` | Stream | Real-time request metrics stream |
+| `breaker:{domain}` | String | Circuit-breaker state: `CLOSED`, `OPEN`, `HALF_OPEN` |
 
-## 13. Service Contracts
+## 10. Service Contracts
 
-### REST API
+### 10.1 REST API Surface
 
-| Method | Endpoint | Description | Auth |
-| --- | --- | --- | --- |
-| `POST` | `/auth/register` | Create a tenant account | None |
+| Method | Endpoint | Purpose | Auth |
+|---|---|---|---|
+| `POST` | `/auth/register` | Create new tenant account | None |
 | `POST` | `/auth/login` | Issue JWT access token | None |
 | `POST` | `/auth/refresh` | Refresh access token | Refresh token |
 | `GET` | `/sites` | List tenant sites | JWT |
-| `POST` | `/sites` | Add a protected site | JWT |
-| `PATCH` | `/sites/:id/config` | Update origin URL and RPS limit | JWT |
-| `DELETE` | `/sites/:id` | Remove a site from protection | JWT |
-| `GET` | `/analytics/:siteId` | Retrieve traffic analytics | JWT |
-| `POST` | `/events` | Create an event mode session | JWT |
-| `GET` | `/billing/usage` | Compare current usage with plan limits | JWT |
-| `POST` | `/billing/upgrade` | Upgrade the subscription plan | JWT |
+| `POST` | `/sites` | Add protected site | JWT |
+| `PATCH` | `/sites/:id/config` | Update RPS limit and origin URL | JWT |
+| `DELETE` | `/sites/:id` | Remove protected site | JWT |
+| `GET` | `/analytics/:siteId` | Fetch traffic analytics | JWT |
+| `POST` | `/events` | Create event mode session | JWT |
+| `GET` | `/billing/usage` | Show current usage versus plan | JWT |
+| `POST` | `/billing/upgrade` | Upgrade subscription plan | JWT |
 
-### gRPC contracts
+### 10.2 gRPC Contract Between Go and Node.js
 
 | RPC Method | Request | Response | Direction |
-| --- | --- | --- | --- |
-| `GetSiteConfig` | `domain: string` | Site config including origin, RPS, and tenant ID | Go -> Node |
+|---|---|---|---|
+| `GetSiteConfig` | `domain: string` | `SiteConfig (rps, origin, tenant_id)` | Go -> Node |
 | `UpdateSiteConfig` | `SiteConfig` | `Ack` | Node -> Go |
 | `ReportMetrics` | `MetricsBatch` | `Ack` | Go -> Node |
 | `GetCircuitState` | `domain: string` | `CircuitState` | Go -> Node |
 
-## 14. Kubernetes Deployment Model
+## 11. Kubernetes Architecture
 
-### Planned service sizing from the SRS
+### 11.1 Service Sizing
 
-| Service | Replicas | Resource Notes | Scale Policy |
-| --- | --- | --- | --- |
-| Proxy | `3 min -> 20 max` | `256MB RAM`, `250m CPU` each | Scale when CPU > 60% |
-| API | `2 min -> 8 max` | `512MB RAM`, `500m CPU` each | Scale when CPU > 70% |
-| Dashboard | `2 min -> 4 max` | `256MB RAM`, `250m CPU` each | Scale when CPU > 80% |
-| Redis | `1` StatefulSet | `1GB RAM` guaranteed | Manual scaling |
-| PostgreSQL | `1` StatefulSet | `2GB RAM`, `1 CPU` | Manual scaling |
+| Service | Replicas | Resources | HPA Target |
+|---|---|---|---|
+| `proxy (Go)` | `3 min -> 20 max` | `256MB RAM`, `250m CPU` each | scale up at `CPU > 60%` |
+| `api (NestJS)` | `2 min -> 8 max` | `512MB RAM`, `500m CPU` each | scale up at `CPU > 70%` |
+| `dashboard (Next.js)` | `2 min -> 4 max` | `256MB RAM`, `250m CPU` each | scale up at `CPU > 80%` |
+| `redis` | `1 StatefulSet` | `1GB RAM guaranteed` | manual scale only |
+| `postgres` | `1 StatefulSet` | `2GB RAM`, `1 CPU` | manual scale only |
 
-### Production traffic topology
+### 11.2 Traffic and Dependency Flow
 
 ```text
 Internet
-  -> LoadBalancer :80/:443
-  -> Go Proxy
-  -> Redis               (rate limits, queue state)
-  -> Origin Server       (if allowed)
-  -> Waiting Room HTML   (if queued)
-  -> NestJS API via gRPC (config sync, metrics reporting)
+  -> Load Balancer (80/443)
+  -> Go Proxy Service
+  -> Redis for rate-limit and queue checks
+  -> Origin Server if allowed
+     or Waiting Room HTML if queued
+
+Go Proxy
+  -> NestJS API via gRPC for config sync and metrics reporting
 
 Browser
-  -> NestJS API via Socket.io (real-time dashboard updates)
+  -> NestJS API via Socket.io for real-time dashboard updates
+
+NestJS API
+  -> PostgreSQL for persistent reads and writes
+  -> Redis for queue management and pub/sub
+
+BullMQ Workers
+  -> Stripe API for hourly usage metering
 ```
 
-## 15. Security Considerations
+## 12. Planned Repository Blueprint
+
+The SRS defines a monorepo using `pnpm workspaces` and `Turborepo` with three applications and shared packages.
+
+```text
+EDGEVIA/
+├── apps/
+│   ├── proxy/
+│   │   ├── cmd/server/main.go
+│   │   ├── internal/proxy/
+│   │   ├── internal/ratelimit/
+│   │   ├── internal/queue/
+│   │   ├── internal/circuitbreaker/
+│   │   ├── internal/ssl/
+│   │   ├── internal/tenant/
+│   │   ├── internal/metrics/
+│   │   ├── internal/logger/
+│   │   ├── proto/config.proto
+│   │   ├── go.mod
+│   │   └── Dockerfile
+│   ├── api/
+│   │   ├── src/modules/auth/
+│   │   ├── src/modules/sites/
+│   │   ├── src/modules/analytics/
+│   │   ├── src/modules/billing/
+│   │   ├── src/modules/events/
+│   │   ├── src/modules/socket/
+│   │   ├── prisma/schema.prisma
+│   │   ├── package.json
+│   │   └── Dockerfile
+│   └── dashboard/
+│       ├── app/(auth)/
+│       ├── app/(protected)/
+│       ├── components/ui/
+│       ├── components/charts/
+│       ├── components/dashboard/
+│       ├── components/waiting-room/
+│       ├── hooks/
+│       ├── store/
+│       ├── package.json
+│       └── Dockerfile
+├── packages/
+│   ├── proto/
+│   └── types/
+├── infra/
+│   ├── k8s/
+│   ├── docker-compose.yml
+│   └── terraform/
+├── docs/
+├── scripts/
+├── pnpm-workspace.yaml
+├── turbo.json
+└── README.md
+```
+
+## 13. Security Architecture
+
+The SRS identifies the following security controls:
 
 | Threat | Mitigation |
-| --- | --- |
-| Tenant data leakage | PostgreSQL RLS and Redis key namespacing by tenant |
-| JWT token theft | Short-lived access tokens and secure `httpOnly` refresh cookies |
-| DDoS against Edgevia itself | Upstream protection such as Cloudflare in front of platform infrastructure |
-| SSL certificate exposure | Encrypted certificate storage and no certificate logging |
-| Stripe webhook spoofing | Signature verification using the Stripe webhook header |
-| Bot traffic in queue | User-Agent screening, behavioral analysis, and optional CAPTCHA |
-| gRPC interception | mTLS between proxy and API services inside Kubernetes |
+|---|---|
+| Tenant data leakage | PostgreSQL RLS and Redis tenant namespacing |
+| JWT token theft | `15 minute` access tokens and secure `httpOnly` refresh-token cookies |
+| DDoS against Edgevia itself | Upstream DDoS protection, with Cloudflare in front of Edgevia infrastructure |
+| SSL certificate exposure | Certificates stored encrypted in PostgreSQL and never logged |
+| Stripe webhook spoofing | Stripe signature verification |
+| Bot traffic in queue | User-agent and behavioral analysis plus CAPTCHA on the waiting room |
+| gRPC interception | `mTLS` between proxy and API services in Kubernetes |
 
-## 16. Delivery Roadmap
+## 14. Operational Characteristics
 
-| Phase | Weeks | Deliverables | Priority |
-| --- | --- | --- | --- |
-| Phase 1: Proxy Core | 1-3 | Go proxy, Redis token bucket, SSL automation, tenant config resolver, Prometheus metrics | Critical |
-| Phase 2: API Service | 4-5 | NestJS API, PostgreSQL schema, Prisma, JWT auth, gRPC client, site CRUD | Critical |
-| Phase 3: Waiting Room | 6-7 | Queue logic, SSE updates, circuit breaker, crawler bypass, waiting room templates | High |
-| Phase 4: Dashboard | 8-9 | Next.js dashboard, Socket.io updates, Zustand store, charts, site switcher, inline RPS config | High |
-| Phase 5: Billing | 10 | Stripe subscriptions, metering, event add-ons, invoice dashboard | High |
-| Phase 6: Kubernetes | 11 | K8s manifests, HPA, Grafana dashboards, staging and production deployment | High |
-| Phase 7: Polish | 12 | Onboarding, notifications, waiting room editor, documentation, beta launch | Medium |
+The architecture is designed to deliver:
 
-## 17. Notes
+- sub-millisecond proxy-path latency
+- support for `50K+` concurrent connections at the proxy tier
+- graceful degradation through queuing instead of hard request drops
+- origin protection through rate limiting and circuit breaking
+- tenant-safe scaling through isolated keyspaces and database policies
+- real-time observability through Prometheus, Grafana, Socket.io, and Redis streams
 
-- This revision standardizes the platform name as **Edgevia** throughout the document.
-- A stray reference to **FairFlow** appears in the SRS text; this document treats it as a naming carryover rather than a separate system.
-- This file is intentionally architecture-focused and leaves pricing, market positioning, and business narrative to the SRS PDF.
+## 15. Architecture Intent
+
+At its core, Edgevia is built around one principle: when customer traffic spikes, the platform should absorb pressure, preserve fairness, and keep the origin alive. The Go proxy handles the traffic edge, Redis manages fast state, PostgreSQL preserves durable truth, the NestJS API governs business workflows, and the Next.js dashboard gives operators live control over the system.

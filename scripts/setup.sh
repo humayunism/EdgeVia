@@ -1,5 +1,5 @@
 #!/bin/bash
-echo "Setting up FairFlow development environment..."
+echo "Setting up Edgevia development environment..."
 cp .env.example .env
 cd infra && docker-compose up -d
 echo "Waiting for PostgreSQL..."

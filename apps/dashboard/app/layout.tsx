@@ -5,7 +5,7 @@ import './globals.css'
 const inter = Inter({ subsets: ['latin'] })
 
 export const metadata: Metadata = {
-  title: 'FairFlow — Traffic Protection Dashboard',
+  title: 'Edgevia — Traffic Protection Dashboard',
   description: 'Real-time reverse proxy and waiting room management',
 }
 
